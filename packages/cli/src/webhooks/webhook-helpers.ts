@@ -105,6 +105,7 @@ export function getWorkflowWebhooks(
 	return returnData;
 }
 
+// eslint-disable-next-line complexity
 export function autoDetectResponseMode(
 	workflowStartNode: INode,
 	workflow: Workflow,
@@ -121,6 +122,21 @@ export function autoDetectResponseMode(
 			}
 
 			if ([FORM_NODE_TYPE, WAIT_NODE_TYPE].includes(node.type) && !node.disabled) {
+				return 'formPage';
+			}
+		}
+	}
+
+	// If there are form nodes connected to a current form node we're dealing with a multipage form
+	// and we need to return the formPage response mode when a second page of the form gets submitted
+	// to be able to show potential form errors correctly.
+	if (workflowStartNode.type === FORM_NODE_TYPE && method === 'POST') {
+		const connectedNodes = workflow.getChildNodes(workflowStartNode.name);
+
+		for (const nodeName of connectedNodes) {
+			const node = workflow.nodes[nodeName];
+
+			if (node.type === FORM_NODE_TYPE && !node.disabled) {
 				return 'formPage';
 			}
 		}
@@ -388,7 +404,7 @@ export async function executeWebhook(
 		'firstEntryJson',
 	) as WebhookResponseData | string | undefined;
 
-	if (!['onReceived', 'lastNode', 'responseNode', 'formPage'].includes(responseMode)) {
+	if (!['onReceived', 'lastNode', 'responseNode', 'formPage', 'streaming'].includes(responseMode)) {
 		// If the mode is not known we error. Is probably best like that instead of using
 		// the default that people know as early as possible (probably already testing phase)
 		// that something does not resolve properly.
@@ -547,9 +563,12 @@ export async function executeWebhook(
 					| undefined;
 			};
 
-			if (responseHeaders !== undefined && responseHeaders.entries !== undefined) {
-				for (const item of responseHeaders.entries) {
-					res.setHeader(item.name, item.value);
+			if (!res.headersSent) {
+				// Only set given headers if they haven't been sent yet, e.g. for streaming
+				if (responseHeaders !== undefined && responseHeaders.entries !== undefined) {
+					for (const item of responseHeaders.entries) {
+						res.setHeader(item.name, item.value);
+					}
 				}
 			}
 		}
@@ -645,6 +664,17 @@ export async function executeWebhook(
 			executionId,
 			responsePromise,
 		);
+
+		if (responseMode === 'streaming') {
+			Container.get(Logger).debug(
+				`Execution of workflow "${workflow.name}" from with ID ${executionId} is set to streaming`,
+				{ executionId },
+			);
+			// TODO: Add check for streaming nodes here
+			runData.httpResponse = res;
+			runData.streamingEnabled = true;
+			didSendResponse = true;
+		}
 
 		if (responseMode === 'formPage' && !didSendResponse) {
 			res.send({ formWaitingUrl: `${additionalData.formWaitingBaseUrl}/${executionId}` });

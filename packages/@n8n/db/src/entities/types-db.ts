@@ -1,5 +1,6 @@
 import type { GlobalRole, Scope } from '@n8n/permissions';
 import type { FindOperator } from '@n8n/typeorm';
+import type express from 'express';
 import type {
 	ICredentialsEncrypted,
 	IRunExecutionData,
@@ -112,6 +113,7 @@ export interface PublicUser {
 	inviteAcceptUrl?: string;
 	isOwner?: boolean;
 	featureFlags?: FeatureFlags; // External type from n8n-workflow
+	lastActiveAt?: Date | null;
 }
 
 export type UserSettings = Pick<User, 'id' | 'settings'>;
@@ -175,7 +177,7 @@ export namespace ExecutionSummaries {
 		status: ExecutionStatus[];
 		workflowId: string;
 		waitTill: boolean;
-		metadata: Array<{ key: string; value: string }>;
+		metadata: Array<{ key: string; value: string; exactMatch?: boolean }>;
 		startedAfter: string;
 		startedBefore: string;
 		annotationTags: string[]; // tag IDs
@@ -269,7 +271,7 @@ export const enum StatisticsNames {
 	dataLoaded = 'data_loaded',
 }
 
-export type AuthProviderType = 'ldap' | 'email' | 'saml'; // | 'google';
+export type AuthProviderType = 'ldap' | 'email' | 'saml' | 'oidc'; // | 'google';
 
 export type FolderWithWorkflowAndSubFolderCount = Folder & {
 	workflowCount?: boolean;
@@ -341,7 +343,7 @@ export interface IGetExecutionsQueryFilter {
 	workflowId?: string;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	waitTill?: FindOperator<any> | boolean;
-	metadata?: Array<{ key: string; value: string }>;
+	metadata?: Array<{ key: string; value: string; exactMatch?: boolean }>;
 	startedAfter?: string;
 	startedBefore?: string;
 }
@@ -354,4 +356,26 @@ export type WorkflowFolderUnionFull = (
 	| FolderWithWorkflowAndSubFolderCount
 ) & {
 	resource: ResourceType;
+};
+
+export type APIRequest<
+	RouteParams = {},
+	ResponseBody = {},
+	RequestBody = {},
+	RequestQuery = {},
+> = express.Request<RouteParams, ResponseBody, RequestBody, RequestQuery> & {
+	browserId?: string;
+};
+
+export type AuthenticatedRequest<
+	RouteParams = {},
+	ResponseBody = {},
+	RequestBody = {},
+	RequestQuery = {},
+> = Omit<APIRequest<RouteParams, ResponseBody, RequestBody, RequestQuery>, 'user' | 'cookies'> & {
+	user: User;
+	cookies: Record<string, string | undefined>;
+	headers: express.Request['headers'] & {
+		'push-ref': string;
+	};
 };
