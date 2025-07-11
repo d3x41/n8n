@@ -3,7 +3,7 @@ import { Logger } from '@n8n/backend-common';
 import { WorkflowsConfig } from '@n8n/config';
 import type { WorkflowEntity, IWorkflowDb } from '@n8n/db';
 import { WorkflowRepository } from '@n8n/db';
-import { OnLeaderStepdown, OnLeaderTakeover, OnShutdown } from '@n8n/decorators';
+import { OnLeaderStepdown, OnLeaderTakeover, OnPubSubEvent, OnShutdown } from '@n8n/decorators';
 import { Service } from '@n8n/di';
 import chunk from 'lodash/chunk';
 import {
@@ -34,6 +34,7 @@ import {
 	WorkflowActivationError,
 	WebhookPathTakenError,
 	UnexpectedError,
+	ensureError,
 } from 'n8n-workflow';
 import { strict } from 'node:assert';
 
@@ -48,6 +49,7 @@ import { executeErrorWorkflow } from '@/execution-lifecycle/execute-error-workfl
 import { ExecutionService } from '@/executions/execution.service';
 import { ExternalHooks } from '@/external-hooks';
 import { NodeTypes } from '@/node-types';
+import { Push } from '@/push';
 import { Publisher } from '@/scaling/pubsub/publisher.service';
 import { ActiveWorkflowsService } from '@/services/active-workflows.service';
 import * as WebhookHelpers from '@/webhooks/webhook-helpers';
@@ -85,6 +87,7 @@ export class ActiveWorkflowManager {
 		private readonly instanceSettings: InstanceSettings,
 		private readonly publisher: Publisher,
 		private readonly workflowsConfig: WorkflowsConfig,
+		private readonly push: Push,
 	) {
 		this.logger = this.logger.scoped(['workflow-activation']);
 	}
@@ -464,7 +467,6 @@ export class ActiveWorkflowManager {
 			this.logger.error(
 				`Issue on initial workflow activation try of ${formatWorkflow(dbWorkflow)} (startup)`,
 				{
-					// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 					error,
 					workflowName: dbWorkflow.name,
 					workflowId: dbWorkflow.id,
@@ -620,6 +622,61 @@ export class ActiveWorkflowManager {
 		return added;
 	}
 
+	@OnPubSubEvent('display-workflow-activation', { instanceType: 'main' })
+	handleDisplayWorkflowActivation({ workflowId }: { workflowId: string }) {
+		this.push.broadcast({ type: 'workflowActivated', data: { workflowId } });
+	}
+
+	@OnPubSubEvent('display-workflow-deactivation', { instanceType: 'main' })
+	handleDisplayWorkflowDeactivation({ workflowId }: { workflowId: string }) {
+		this.push.broadcast({ type: 'workflowDeactivated', data: { workflowId } });
+	}
+
+	@OnPubSubEvent('display-workflow-activation-error', { instanceType: 'main' })
+	handleDisplayWorkflowActivationError({
+		workflowId,
+		errorMessage,
+	}: { workflowId: string; errorMessage: string }) {
+		this.push.broadcast({
+			type: 'workflowFailedToActivate',
+			data: { workflowId, errorMessage },
+		});
+	}
+
+	@OnPubSubEvent('add-webhooks-triggers-and-pollers', {
+		instanceType: 'main',
+		instanceRole: 'leader',
+	})
+	async handleAddWebhooksTriggersAndPollers({ workflowId }: { workflowId: string }) {
+		try {
+			await this.add(workflowId, 'activate', undefined, {
+				shouldPublish: false, // prevent leader from re-publishing message
+			});
+
+			this.push.broadcast({ type: 'workflowActivated', data: { workflowId } });
+
+			await this.publisher.publishCommand({
+				command: 'display-workflow-activation',
+				payload: { workflowId },
+			}); // instruct followers to show activation in UI
+		} catch (e) {
+			const error = ensureError(e);
+			const { message } = error;
+
+			await this.workflowRepository.update(workflowId, { active: false });
+
+			this.push.broadcast({
+				type: 'workflowFailedToActivate',
+				data: { workflowId, errorMessage: message },
+			});
+
+			await this.publisher.publishCommand({
+				command: 'display-workflow-activation-error',
+				payload: { workflowId, errorMessage: message },
+			}); // instruct followers to show activation error in UI
+		}
+	}
+
 	/**
 	 * A workflow can only be activated if it has a node which has either triggers
 	 * or webhooks defined.
@@ -720,7 +777,6 @@ export class ActiveWorkflowManager {
 						error.message as string
 					}" | retry in ${Math.floor(lastTimeout / 1000)} seconds`,
 					{
-						// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 						error,
 						workflowId,
 						workflowName,
@@ -812,6 +868,20 @@ export class ActiveWorkflowManager {
 		// if it's active in memory then it's a trigger
 		// so remove from list of actives workflows
 		await this.removeWorkflowTriggersAndPollers(workflowId);
+	}
+
+	@OnPubSubEvent('remove-triggers-and-pollers', { instanceType: 'main', instanceRole: 'leader' })
+	async handleRemoveTriggersAndPollers({ workflowId }: { workflowId: string }) {
+		await this.removeActivationError(workflowId);
+		await this.removeWorkflowTriggersAndPollers(workflowId);
+
+		this.push.broadcast({ type: 'workflowDeactivated', data: { workflowId } });
+
+		// instruct followers to show workflow deactivation in UI
+		await this.publisher.publishCommand({
+			command: 'display-workflow-deactivation',
+			payload: { workflowId },
+		});
 	}
 
 	/**
